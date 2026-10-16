@@ -82,7 +82,7 @@ func (c *rolloutContext) reconcile() error {
 		// exit early since we modified the rollout
 		return nil
 	}
-	if reset, err := c.resetAnalysisForRetry(); reset || err != nil {
+	if err := c.resetAnalysisForRetry(); err != nil {
 		return err
 	}
 
@@ -105,12 +105,12 @@ func (c *rolloutContext) reconcile() error {
 
 // resetAnalysisForRetry clears the aborted attempt's analysis references and,
 // when pre-promotion analysis is configured, its Blue/Green preview checkpoint.
-// The reset must be persisted before status updates clear AbortedAt;
-// otherwise a later reconciliation can still treat an old run as current.
+// The reset is persisted before continuing this pass so later status updates
+// cannot clear AbortedAt while still leaving old runs current.
 // The resource-version check prevents stale cleanup from overwriting a newer attempt.
-func (c *rolloutContext) resetAnalysisForRetry() (bool, error) {
+func (c *rolloutContext) resetAnalysisForRetry() error {
 	if c.rollout.Status.Abort || c.rollout.Status.AbortedAt == nil {
-		return false, nil
+		return nil
 	}
 	next := c.rollout.DeepCopy()
 	var previous []*v1alpha1.AnalysisRun
@@ -118,7 +118,7 @@ func (c *rolloutContext) resetAnalysisForRetry() (bool, error) {
 		status := &next.Status.BlueGreen
 		resetPreview := bg.PrePromotionAnalysis != nil && status.ScaleUpPreviewCheckPoint
 		if status.PrePromotionAnalysisRunStatus == nil && status.PostPromotionAnalysisRunStatus == nil && !resetPreview {
-			return false, nil
+			return nil
 		}
 		previous = []*v1alpha1.AnalysisRun{c.currentArs.BlueGreenPrePromotion, c.currentArs.BlueGreenPostPromotion}
 		status.PrePromotionAnalysisRunStatus = nil
@@ -129,21 +129,30 @@ func (c *rolloutContext) resetAnalysisForRetry() (bool, error) {
 	} else if next.Spec.Strategy.Canary != nil {
 		status := &next.Status.Canary
 		if status.CurrentStepAnalysisRunStatus == nil && status.CurrentBackgroundAnalysisRunStatus == nil {
-			return false, nil
+			return nil
 		}
 		previous = []*v1alpha1.AnalysisRun{c.currentArs.CanaryStep, c.currentArs.CanaryBackground}
 		status.CurrentStepAnalysisRunStatus = nil
 		status.CurrentBackgroundAnalysisRunStatus = nil
 	}
 	if err := c.cancelAnalysisRuns(previous); err != nil {
-		return false, err
+		return err
 	}
 	updated, err := c.argoprojclientset.ArgoprojV1alpha1().Rollouts(next.Namespace).UpdateStatus(context.TODO(), next, metav1.UpdateOptions{})
 	if err != nil {
-		return false, err
+		return err
 	}
+	// Continue with the persisted status and version, retaining the pod template,
+	// selector, and annotations resolved locally from workloadRef earlier in this
+	// pass. The status API response does not contain those resolved fields.
+	next.Status = updated.Status
+	next.ResourceVersion = updated.ResourceVersion
 	c.newRollout = updated
-	return true, nil
+	c.rollout = next
+	c.pauseContext.rollout = next
+	allRuns := append(c.otherArs, c.currentArs.ToArray()...)
+	c.currentArs, c.otherArs = analysisutil.FilterCurrentRolloutAnalysisRuns(allRuns, next)
+	return nil
 }
 
 func (c *rolloutContext) SetRestartedAt() {

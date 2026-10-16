@@ -469,18 +469,15 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	}
 
 	err = roCtx.reconcile()
-	if err != nil {
-		logCtx.Errorf("roCtx.reconcile err %v", err)
-		// return an err here so that we do not update the informer cache with a "bad" rollout object, for the case when
-		// we get an error during reconciliation but c.newRollout still gets updated this can happen in syncReplicaSetRevision
-		// https://github.com/argoproj/argo-rollouts/issues/2522#issuecomment-1492181154 I also believe there are other cases
-		// that newRollout can get updated while we get an error during reconciliation
-		return err
-	}
 	if roCtx.newRollout != nil {
+		// A retry reset may have been saved before a later operation failed. Track
+		// the accepted write so a queued pass waits for the informer to observe it.
 		c.rolloutVersionTracker.Record(key, roCtx.newRollout.ResourceVersion)
 	}
-	return nil
+	if err != nil {
+		logCtx.Errorf("roCtx.reconcile err %v", err)
+	}
+	return err
 }
 
 func (c *Controller) newRolloutContext(rollout *v1alpha1.Rollout) (*rolloutContext, error) {

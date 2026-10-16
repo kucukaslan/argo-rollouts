@@ -34,6 +34,7 @@ import (
 	analysisutil "github.com/argoproj/argo-rollouts/utils/analysis"
 	"github.com/argoproj/argo-rollouts/utils/annotations"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
+	controllerutil "github.com/argoproj/argo-rollouts/utils/controller"
 	replicasetutil "github.com/argoproj/argo-rollouts/utils/replicaset"
 	rolloututil "github.com/argoproj/argo-rollouts/utils/rollout"
 )
@@ -4389,6 +4390,117 @@ func TestAnalysisRetryPreservesNewerAttempt(t *testing.T) {
 			assert.Equal(t, phase, actual.Status.Canary.CurrentStepAnalysisRunStatus.Status)
 			assert.Nil(t, actual.Status.AbortedAt)
 			assert.Equal(t, old.Name, r2.Status.Canary.CurrentStepAnalysisRunStatus.Name, "retry must not mutate the old snapshot")
+		})
+	}
+}
+
+// A retry must resume work after detaching the old attempt, including when the
+// reconciliation takes the scaling-only path or fails after saving the reset.
+func TestAnalysisRetryContinuesAfterReset(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		scalingEvent   bool
+		serviceFailure bool
+		workloadRef    bool
+	}{
+		{name: "NormalReconciliation"},
+		{name: "ScalingEvent", scalingEvent: true},
+		{name: "ServiceFailure", serviceFailure: true},
+		{name: "WorkloadRef", workloadRef: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			defer f.Close()
+			ctx := context.Background()
+			at := analysisTemplate("post-analysis")
+			r1 := newBlueGreenRollout("retry-one-pass", 1, nil, "active", "preview")
+			r2 := bumpVersion(r1)
+			r2.Spec.Strategy.BlueGreen.PostPromotionAnalysis = &v1alpha1.RolloutAnalysis{
+				Templates: []v1alpha1.AnalysisTemplateRef{{TemplateName: at.Name}},
+			}
+			rs1 := newReplicaSetWithStatus(r1, 1, 1)
+			rs2 := newReplicaSetWithStatus(r2, 0, 0)
+			if tt.scalingEvent {
+				rs1.Annotations[annotations.DesiredReplicasAnnotation] = "2"
+			}
+			stable := rs1.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+			candidate := rs2.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+			r2 = updateBlueGreenRolloutStatus(r2, candidate, stable, stable, 1, 0, 1, 1, false, true, false)
+			r2.ResourceVersion = "100"
+			now := timeutil.MetaNow()
+			r2.Status.AbortedAt = &now // Retry has cleared Abort, but left the old reference.
+			old := analysisRun(at, v1alpha1.RolloutTypePostPromotionLabel, r2)
+			old.Status.Phase = v1alpha1.AnalysisPhaseFailed
+			r2.Status.BlueGreen.PostPromotionAnalysisRunStatus = &v1alpha1.RolloutAnalysisRunStatus{Name: old.Name, Status: old.Status.Phase}
+			active := newService("active", 80, map[string]string{v1alpha1.DefaultRolloutUniqueLabelKey: stable}, r2)
+			preview := newService("preview", 80, map[string]string{v1alpha1.DefaultRolloutUniqueLabelKey: candidate}, r2)
+			if tt.serviceFailure {
+				preview.Spec.Selector[v1alpha1.DefaultRolloutUniqueLabelKey] = stable
+			}
+			if tt.workloadRef {
+				template := r2.Spec.Template.DeepCopy()
+				selector := r2.Spec.Selector.DeepCopy()
+				r2.Spec.WorkloadRef = &v1alpha1.ObjectRef{APIVersion: "apps/v1", Kind: "Deployment", Name: "workload"}
+				r2.Spec.Template = corev1.PodTemplateSpec{}
+				r2.Spec.Selector = nil
+				f.workloadRefResolveFn = func(r *v1alpha1.Rollout) error {
+					r.Spec.SetResolvedTemplate(*template.DeepCopy())
+					r.Spec.SetResolvedSelector(selector.DeepCopy())
+					return nil
+				}
+			}
+			f.objects = []runtime.Object{r2, at, old}
+			f.rolloutLister = []*v1alpha1.Rollout{r2}
+			f.analysisTemplateLister = []*v1alpha1.AnalysisTemplate{at}
+			f.analysisRunLister = []*v1alpha1.AnalysisRun{old}
+			f.replicaSetLister = []*appsv1.ReplicaSet{rs1, rs2}
+			f.serviceLister = []*corev1.Service{active, preview}
+			f.kubeobjects = []runtime.Object{rs1, rs2, active, preview}
+			c, _, _ := f.newController(noResyncPeriodFunc)
+			// Model API serialization and version advancement, both omitted by the
+			// default fake. Resolved workloadRef fields must not survive the wire.
+			f.client.PrependReactor("update", "rollouts", func(action core.Action) (bool, runtime.Object, error) {
+				if action.GetSubresource() != "status" {
+					return false, nil, nil
+				}
+				raw, err := json.Marshal(action.(core.UpdateAction).GetObject())
+				require.NoError(t, err)
+				var saved v1alpha1.Rollout
+				require.NoError(t, json.Unmarshal(raw, &saved))
+				saved.ResourceVersion = "200"
+				gvr := v1alpha1.SchemeGroupVersion.WithResource("rollouts")
+				require.NoError(t, f.client.Tracker().Update(gvr, &saved, saved.Namespace))
+				return true, saved.DeepCopy(), nil
+			})
+			serviceErr := errors.New("service temporarily unavailable")
+			if tt.serviceFailure {
+				f.kubeclient.PrependReactor("patch", "services", func(core.Action) (bool, runtime.Object, error) {
+					return true, nil, serviceErr
+				})
+			}
+			key := getKey(r2, t)
+			err := c.syncHandler(ctx, key)
+			if tt.serviceFailure {
+				require.ErrorIs(t, err, serviceErr)
+				// The saved reset must be observed before processing the cached old
+				// attempt again, even though later work failed in this pass.
+				require.ErrorIs(t, c.syncHandler(ctx, key), controllerutil.StaleCacheError)
+			} else {
+				require.NoError(t, err)
+			}
+			actual, err := f.client.ArgoprojV1alpha1().Rollouts(r2.Namespace).Get(ctx, r2.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			assert.Nil(t, actual.Status.BlueGreen.PostPromotionAnalysisRunStatus)
+			assert.False(t, actual.Status.Abort)
+			if !tt.serviceFailure {
+				candidateRS, err := f.kubeclient.AppsV1().ReplicaSets(r2.Namespace).Get(ctx, rs2.Name, metav1.GetOptions{})
+				require.NoError(t, err)
+				assert.Equal(t, int32(1), *candidateRS.Spec.Replicas, "candidate scales during the same pass that saves the reset")
+				sets, err := f.kubeclient.AppsV1().ReplicaSets(r2.Namespace).List(ctx, metav1.ListOptions{})
+				require.NoError(t, err)
+				assert.Len(t, sets.Items, 2, "retry must not create another revision")
+			}
+			assert.Equal(t, old.Name, r2.Status.BlueGreen.PostPromotionAnalysisRunStatus.Name, "informer snapshot is unchanged")
 		})
 	}
 }
